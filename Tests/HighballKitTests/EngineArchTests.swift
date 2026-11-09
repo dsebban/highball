@@ -190,6 +190,61 @@ final class EngineArchTests: XCTestCase {
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: intelRoot.appending(path: "engine/bin/wine").path))
     }
 
+    /// An Intel engine's unsigned loaders get an ad hoc signature on read (Apple's Neural Engine
+    /// daemon turns down unsigned callers). The signed file replaces the loader by rename, so the
+    /// original file, which a running game may have mapped, is never written; the loader still runs;
+    /// a signed loader is left as it is; a symlinked one is not ours; a failed signing leaves the
+    /// loader intact and nothing beside it.
+    func testAnIntelEnginesUnsignedLoadersAreSignedOnRead() throws {
+        let fm = FileManager.default
+        let intel = manifest("x86_64", requires: ["rosetta2"])
+        func unsignedLoader(_ url: URL) throws {
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Shell.run("/usr/bin/lipo", ["/usr/bin/true", "-thin", "x86_64", "-output", url.path])
+            try Shell.run("/usr/bin/codesign", ["--remove-signature", url.path])
+            XCTAssertTrue(EngineStore.isUnsignedMachO64(url), "the fixture starts unsigned, as CI ships it")
+        }
+        func leftovers(_ dir: URL) throws -> [String] { try fm.contentsOfDirectory(atPath: dir.path).filter { $0 != "wine" } }
+
+        let root = tempRoot("x64-signed")
+        let loaders = ["engine/bin/wine", "engine/lib/wine/x86_64-unix/wine"].map { root.appending(path: $0) }
+        for url in loaders { try unsignedLoader(url) }
+        let mapped = root.appending(path: "mapped-by-a-running-game")
+        try fm.linkItem(at: loaders[0], to: mapped)
+        try EngineStore().linkSignedLoader(root, manifest: intel, helper: nil)
+        for url in loaders {
+            XCTAssertFalse(EngineStore.isUnsignedMachO64(url))
+            XCTAssertNoThrow(try Shell.run("/usr/bin/codesign", ["--verify", url.path]), "\(url.lastPathComponent) carries a valid signature")
+            XCTAssertNil(try? fm.destinationOfSymbolicLink(atPath: url.path), "an Intel loader is signed in place of the file, never linked")
+            XCTAssertEqual(try leftovers(url.deletingLastPathComponent()), [])
+            XCTAssertNoThrow(try Shell.run("/usr/bin/arch", ["-x86_64", url.path]), "the signed loader still runs")
+        }
+        XCTAssertTrue(EngineStore.isUnsignedMachO64(mapped), "the file a running game has open is not written to")
+        let inode = { (try fm.attributesOfItem(atPath: loaders[0].path)[.systemFileNumber]) as? Int }
+        let before = try inode()
+        try EngineStore().linkSignedLoader(root, manifest: intel, helper: nil)
+        XCTAssertEqual(try inode(), before, "a signed loader is not rewritten on the next read")
+        XCTAssertFalse(EngineStore.isUnsignedMachO64(URL(fileURLWithPath: "/usr/bin/true")), "a universal file is not ours to sign")
+
+        // A symlinked loader is left alone, and so is its target.
+        let linked = tempRoot("x64-linked"), target = linked.appending(path: "elsewhere/wine")
+        try unsignedLoader(target)
+        try fm.createDirectory(at: linked.appending(path: "engine/bin"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: linked.appending(path: "engine/bin/wine"), withDestinationURL: target)
+        try EngineStore().linkSignedLoader(linked, manifest: intel, helper: nil)
+        XCTAssertTrue(EngineStore.isUnsignedMachO64(target))
+
+        // Signing fails (a folder that cannot be written): the loader stays as it was, nothing is left beside it.
+        let locked = tempRoot("x64-locked"), bin = locked.appending(path: "engine/bin")
+        try unsignedLoader(bin.appending(path: "wine"))
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: bin.path)
+        addTeardownBlock { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bin.path) }
+        try EngineStore().linkSignedLoader(locked, manifest: intel, helper: nil)
+        XCTAssertTrue(EngineStore.isUnsignedMachO64(bin.appending(path: "wine")))
+        XCTAssertNoThrow(try Shell.run("/usr/bin/arch", ["-x86_64", bin.appending(path: "wine").path]))
+        XCTAssertEqual(try leftovers(bin), [])
+    }
+
     func testTheHelperIsFoundInTheEnvironmentThenTheAppThenApplications() throws {
         let app = tempRoot("App").appendingPathExtension("app"), installed = tempRoot("Installed").appendingPathExtension("app")
         let nowhere = URL(fileURLWithPath: "/nonexistent/Highball.app")

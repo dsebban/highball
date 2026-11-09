@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import os
 
 public enum HighballError: Error, CustomStringConvertible {
     case checksumMismatch(file: String, expected: String, actual: String)
@@ -644,10 +645,12 @@ public struct EngineStore: Sendable {
     /// symlink to the helper and `bin/wine` a relative link to it, the way Wine installs its own;
     /// the engine's loader, built unsigned by CI, is set aside once as `wine.unsigned`. Redone on
     /// every read of the engine, like linkRuntime, so an app that moved, or was updated (the helper
-    /// is the app's), heals its engines on the next launch. Nothing happens for an Intel engine, or
-    /// when no helper is on this Mac (the CLI without the app; `missingFiles` then says so).
+    /// is the app's), heals its engines on the next launch. An Intel engine keeps its own loader,
+    /// signed ad hoc (signIntelLoader). Nothing happens for an arm64 engine when no helper is on this
+    /// Mac (the CLI without the app; `missingFiles` then says so).
     func linkSignedLoader(_ root: URL, manifest: EngineManifest, helper: URL? = WineLoaderHelper.locate()) throws {
-        guard manifest.isNativeARM64, let helper else { return }
+        guard manifest.isNativeARM64 else { return signIntelLoader(root, manifest: manifest) }
+        guard let helper else { return }
         let fm = FileManager.default
         let unixDir = root.appending(path: "engine/lib/wine/\(manifest.unixLibDir)", directoryHint: .isDirectory)
         for (link, target) in [(unixDir.appending(path: "wine"), helper.path),
@@ -663,6 +666,62 @@ public struct EngineStore: Sendable {
             try fm.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.createSymbolicLink(atPath: link.path, withDestinationPath: target)
         }
+    }
+
+    /// Signs an Intel engine's Wine loaders ad hoc, once, when they arrive unsigned (CI builds them
+    /// that way). Apple's Neural Engine daemon turned down every compile request from the unsigned
+    /// game process ("refusing compile ... csIdentity=<engine>/lib/wine/x86_64-unix/wine_unsigned"),
+    /// and MPSGraph then compiled its networks for the GPU ("Falling back to full compile on GPU").
+    /// CrossOver's loader carries a Developer ID signature and does not hit this. Measured
+    /// 2026-11-09 on an M6, macOS 27.2, Hellblade II with D3DMetal 4.0b3, MetalFX, frame generation
+    /// off, 3 interleaved runs each: 38.6 fps unsigned, 39.1 signed and 39.1 on CrossOver (GPU 26.1,
+    /// 25.8 and 25.8 ms), with the fallback gone once signed. That the fallback is what costs the GPU
+    /// time is inferred from that, not traced. Each call signs its own copy and renames it over the
+    /// loader: a game running from the old file keeps its mapping, and two processes signing at once
+    /// each install a whole signed file (codesign on the loader itself always stages in
+    /// <loader>.cstemp, and two of them racing there left a file with a broken signature).
+    /// A symlinked loader is not ours. A loader that fails to sign is tried again only in a later
+    /// process, so a failure does not cost every read.
+    func signIntelLoader(_ root: URL, manifest: EngineManifest) {
+        let fm = FileManager.default
+        for path in ["engine/bin/wine", "engine/lib/wine/\(manifest.unixLibDir)/wine"] {
+            let url = root.appending(path: path)
+            guard (try? fm.destinationOfSymbolicLink(atPath: url.path)) == nil, Self.isUnsignedMachO64(url),
+                  Self.signingAttempted.withLock({ $0.insert(url.path).inserted }) else { continue }
+            let staged = url.appendingPathExtension("signing-\(UUID().uuidString)")
+            do {
+                try fm.copyItem(at: url, to: staged)
+                try Shell.run("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier", "org.winehq.wine", staged.path])
+                guard rename(staged.path, url.path) == 0 else { throw CocoaError(.fileWriteUnknown) }
+                Self.signingAttempted.withLock { _ = $0.remove(url.path) }
+            } catch {
+                try? fm.removeItem(at: staged)
+            }
+        }
+    }
+
+    /// Loaders this process tried and failed to sign (see signIntelLoader).
+    static let signingAttempted = OSAllocatedUnfairLock(initialState: Set<String>())
+
+    /// True for a thin 64-bit Mach-O file with no code signature load command. Reads only the
+    /// header and load commands, so the check is cheap enough for every read of an engine.
+    static func isUnsignedMachO64(_ url: URL) -> Bool {
+        guard let h = FileHandle(forReadingAtPath: url.path) else { return false }
+        defer { try? h.close() }
+        guard let header = try? h.read(upToCount: 32), header.count == 32 else { return false }
+        func u32(_ d: Data, _ o: Int) -> UInt32 { d.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: o, as: UInt32.self) } }
+        guard u32(header, 0) == 0xfeedfacf else { return false }   // MH_MAGIC_64, little-endian
+        let ncmds = Int(u32(header, 16)), size = Int(u32(header, 20))
+        guard size > 0, size < 1 << 20, let cmds = try? h.read(upToCount: size), cmds.count == size else { return false }
+        var offset = 0
+        for _ in 0..<ncmds {
+            guard offset + 8 <= cmds.count else { return false }
+            if u32(cmds, offset) == 0x1d { return false }            // LC_CODE_SIGNATURE
+            let step = Int(u32(cmds, offset + 4))
+            guard step >= 8 else { return false }
+            offset += step
+        }
+        return true
     }
 
     func stripQuarantine(_ url: URL) throws {
