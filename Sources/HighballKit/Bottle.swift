@@ -267,9 +267,11 @@ public struct Pin: Codable, Sendable, Identifiable, Hashable {
     public var arguments: [String] = []
     public var environment: [String: String] = [:]
     public var renderer: Renderer? = nil
+    /// D3DMetal frame interpolation for this program alone (see FrameInterpolationProfile).
+    public var interpolation: FrameInterpolationProfile? = nil
 
-    public init(name: String, path: String, arguments: [String] = [], environment: [String: String] = [:], renderer: Renderer? = nil) {
-        self.name = name; self.path = path; self.arguments = arguments; self.environment = environment; self.renderer = renderer
+    public init(name: String, path: String, arguments: [String] = [], environment: [String: String] = [:], renderer: Renderer? = nil, interpolation: FrameInterpolationProfile? = nil) {
+        self.name = name; self.path = path; self.arguments = arguments; self.environment = environment; self.renderer = renderer; self.interpolation = interpolation
     }
 
     /// This pin as one Play of it runs: the mode Play chose for the program (its page's Mode for
@@ -321,7 +323,7 @@ public struct Pin: Codable, Sendable, Identifiable, Hashable {
         return url.path
     }
 
-    enum CodingKeys: String, CodingKey { case id, name, path, arguments, environment, renderer }
+    enum CodingKeys: String, CodingKey { case id, name, path, arguments, environment, renderer, interpolation }
 
     /// Lenient decode: hand-written recipe pins may omit id/arguments/environment.
     /// (The synthesized decoder treats defaulted non-optionals as required keys.)
@@ -333,6 +335,7 @@ public struct Pin: Codable, Sendable, Identifiable, Hashable {
         arguments = try c.decodeIfPresent([String].self, forKey: .arguments) ?? []
         environment = try c.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
         renderer = try c.decodeIfPresent(Renderer.self, forKey: .renderer)
+        interpolation = try c.decodeIfPresent(FrameInterpolationProfile.self, forKey: .interpolation)
     }
 }
 

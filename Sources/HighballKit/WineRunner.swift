@@ -146,7 +146,7 @@ public struct WineRunner: Sendable {
         }
         // The Mac's output rate: a sound report is unanswerable without it (highball#127).
         if let audio = AudioOutput.headerLine(sampleRate: AudioOutput.defaultOutputSampleRate()) { out += audio }
-        for key in ["WINEDLLPATH_PREPEND", "WINEDLLOVERRIDES", "ROSETTA_ADVERTISE_AVX", "MTL_HUD_ENABLED", "CX_FWD_COMPAT_GL_CTX", "DXVK_CONFIG_FILE", "DXVK_LOG_PATH", "DXVK_CONFIG", "VKD3D_SHADER_MODEL", "VKD3D_FEATURE_LEVEL", "VKD3D_CONFIG", "VKD3D_SHADER_CACHE_PATH", "LSFGM_MULTIPLIER", "LSFGM_PACING_MODE", "LSFGM_FLOW_SCALE", "LSFGM_DLL_PATH"] {
+        for key in ["WINEDLLPATH_PREPEND", "WINEDLLOVERRIDES", "ROSETTA_ADVERTISE_AVX", "MTL_HUD_ENABLED", "CX_FWD_COMPAT_GL_CTX", "CX_ACTIVE_GRAPHICS_BACKEND", "DXVK_CONFIG_FILE", "DXVK_LOG_PATH", "DXVK_CONFIG", "VKD3D_SHADER_MODEL", "VKD3D_FEATURE_LEVEL", "VKD3D_CONFIG", "VKD3D_SHADER_CACHE_PATH", "LSFGM_MULTIPLIER", "LSFGM_PACING_MODE", "LSFGM_FLOW_SCALE", "LSFGM_DLL_PATH"] {
             if let value = env[key] { out += "# \(key)=\(value)\n" }
         }
         // Renderer and controller switches a player or a recipe sets: settings, never personal, and
@@ -424,7 +424,7 @@ public struct WineRunner: Sendable {
         guard FileManager.default.fileExists(atPath: exe.path) else {
             throw HighballError.invalid("\(pin.name) points at \(pin.path), which isn't there. If this was added by an older Highball, remove it and drag the program in again.")
         }
-        let env = pin.environment.merging(extraEnvironment) { $1 }
+        var env = pin.environment.merging(extraEnvironment) { $1 }
         // A pin's own mode is a preference recorded by a recipe or a person, not a demand: when
         // this engine cannot run it, the environment's mode applies (and degrades in turn if it
         // must), with a note, rather than a launch that dies before Wine (#61).
@@ -434,10 +434,22 @@ public struct WineRunner: Sendable {
             renderer = nil
         }
         // cwd = the exe's folder, as a Windows shortcut would — games with relative asset paths need it.
+        var cwd = exe.deletingLastPathComponent()
+        var note: String?
+        // A frame interpolation profile applies only when it can work; otherwise the program starts
+        // as it would without one, and the header says why.
+        if let profile = pin.interpolation {
+            let effective = try bottle.effectiveRenderer(requested: renderer, engine: engine).renderer
+            let launch = profile.launch(executable: exe, renderer: effective, engine: engine, bottle: bottle)
+            env.merge(launch.environment) { _, profile in profile }
+            cwd = launch.workingDirectory
+            note = launch.note
+            onOutput?("note: \(launch.note)")
+        }
         // Wine gets the path through the link by its Windows name, since that path has no Mac side.
         let throughLink = exe.path != named.path
         return try await start(exe, arguments: pin.arguments, renderer: renderer, extraEnvironment: env,
-                               workingDirectory: exe.deletingLastPathComponent(),
+                               workingDirectory: cwd, headerNote: note,
                                program: throughLink ? WineReparsePoint.windowsPath(for: named, driveC: bottle.driveC) : nil, onOutput: onOutput)
     }
 

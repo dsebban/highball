@@ -58,6 +58,7 @@ struct Engine: AsyncParsableCommand {
     struct Install: AsyncParsableCommand {
         @Argument(help: "Path to an engine manifest JSON.") var manifest: String
         @Flag(name: .customLong("accept-d3dmetal-license"), help: "Accept Apple's Game Porting Toolkit license and install D3DMetal.") var acceptD3DMetal = false
+        @Option(name: .customLong("local-d3dmetal"), help: "Link the manifest's D3DMetal from a Game Porting Toolkit on this Mac (a folder holding external/D3DMetal.framework and wine/, e.g. CrossOver's lib64/apple_gptk) instead of downloading it. Needs --accept-d3dmetal-license.") var localD3DMetal: String?
 
         func run() async throws {
             let m = try EngineManifest.load(from: URL(fileURLWithPath: manifest))
@@ -67,12 +68,20 @@ struct Engine: AsyncParsableCommand {
             print("installing \(m.id): \(m.displayName)")
             var accepted: Set<String> = []
             if acceptD3DMetal { accepted.insert("apple-gptk-license-2023-08-17") }
-            let engine = try await EngineStore().install(m, accepted: accepted) { name, got, total in
+            let progress: DownloadProgress = { name, got, total in
                 let t = total ?? 0
                 let mb = { (b: Int64) in String(format: "%.0f", Double(b) / 1_048_576) }
                 // \r keeps one live-updating line per component; newline when it completes.
                 print("\r  \(name): \(mb(got))\(t > 0 ? " / \(mb(t))" : "") MB", terminator: t > 0 && got >= t ? "\n" : "")
                 fflush(stdout)
+            }
+            let engine: InstalledEngine
+            if let localD3DMetal {
+                let source = URL(fileURLWithPath: (localD3DMetal as NSString).expandingTildeInPath, isDirectory: true)
+                engine = try await EngineStore().install(m, localD3DMetal: source, accepted: accepted, progress: progress)
+                print("d3dmetal: \(engine.manifest.components["d3dmetal"]?.version ?? "?")")
+            } else {
+                engine = try await EngineStore().install(m, accepted: accepted, progress: progress)
             }
             print("installed \(engine.id) at \(engine.root.path)")
             print("wine: \(try engine.wineVersion())")
@@ -141,7 +150,7 @@ struct Bottle: AsyncParsableCommand {
     }
 
     struct Set: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Change a bottle setting: engine, renderer, winver, sync, hud, avx, dpi, retina on|off, dxvkasync, framegen, framegenadaptive, framegenflow, framegenperformance, framegenforcevsync, dlloverrides, keepfiles on|off, env KEY=VALUE (empty VALUE removes)")
+        static let configuration = CommandConfiguration(abstract: "Change a bottle setting: engine, renderer, winver, sync, hud, avx, dpi, retina on|off, dxvkasync, dlss on|off, framegen, framegenadaptive, framegenflow, framegenperformance, framegenforcevsync, dlloverrides, keepfiles on|off, env KEY=VALUE (empty VALUE removes)")
         @Argument var name: String
         @Argument var setting: String
         @Argument var value: String
@@ -168,6 +177,7 @@ struct Bottle: AsyncParsableCommand {
             case "hud": b.settings.metalHUD = (value == "1" || value == "true")
             case "avx": b.settings.advertiseAVX = (value == "1" || value == "true")
             case "dxvkasync": b.settings.dxvkAsync = (value == "1" || value == "true")
+            case "dlss": b.settings.dlssEnabled = (value == "1" || value == "true" || value == "on")
             case "framegen":
                 guard let m = Int(value), (1...4).contains(m) else { fail("framegen expects a multiplier 1..4 (1 = off)") }
                 b.settings.frameGen = m
@@ -307,7 +317,7 @@ struct PinCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "pin",
         abstract: "Per-program settings: persistent launch arguments, environment, renderer.",
-        subcommands: [List.self, Add.self, Set.self])
+        subcommands: [List.self, Add.self, Set.self, Check.self])
 
     struct Add: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Pin a program: a Windows path, a unix path (preinstalled games anywhere on disk), or a drive_c-relative path.")
@@ -347,13 +357,14 @@ struct PinCommand: AsyncParsableCommand {
                 if !p.arguments.isEmpty { extras.append("args=\(ArgumentLine.join(p.arguments))") }
                 if !p.environment.isEmpty { extras.append("env=" + p.environment.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ";")) }
                 if let r = p.renderer { extras.append("renderer=\(r.rawValue)") }
+                if let fi = p.interpolation { extras.append("interpolation=\(InterpolationArgument.describe(fi))") }
                 print("\(p.name)\t\(p.path)" + (extras.isEmpty ? "" : "\t" + extras.joined(separator: "\t")))
             }
         }
     }
 
     struct Set: AsyncParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Change a pin setting: args (rest of line), renderer (name or default), env KEY=VALUE (VALUE empty removes).")
+        static let configuration = CommandConfiguration(abstract: "Change a pin setting: args (rest of line), renderer (name or default), env KEY=VALUE (VALUE empty removes), interpolation cap=N mtl4=0|1 cwd=PATH (replaces the whole profile; or off).")
         @Argument var bottle: String
         @Argument var pin: String
         @Argument var setting: String
@@ -375,12 +386,61 @@ struct PinCommand: AsyncParsableCommand {
                 else { fail("bad renderer \(v)") }
             case "env":
                 guard let v = value.first, EnvAssignment.apply(v, to: &b.settings.pins[i].environment) else { fail("env expects KEY=VALUE (empty VALUE removes)") }
-            default: fail("unknown setting \(setting) (args, renderer, env)")
+            case "interpolation":
+                guard let profile = InterpolationArgument.parse(value) else { fail("interpolation expects off, or any of cap=N mtl4=0|1 cwd=PATH (cwd relative to the program's folder or absolute)") }
+                b.settings.pins[i].interpolation = profile
+            default: fail("unknown setting \(setting) (args, renderer, env, interpolation)")
             }
             try bs.update(b)
             let p = b.settings.pins[i]
-            print("ok — \(p.name): args=[\(ArgumentLine.join(p.arguments))] renderer=\(p.renderer?.rawValue ?? "default") env=\(p.environment.count) vars")
+            print("ok — \(p.name): args=[\(ArgumentLine.join(p.arguments))] renderer=\(p.renderer?.rawValue ?? "default") env=\(p.environment.count) vars interpolation=\(p.interpolation.map(InterpolationArgument.describe) ?? "off")")
         }
+    }
+
+    struct Check: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Say whether a pin's frame interpolation profile would apply, with the variables and working folder it would start with. Starts nothing.")
+        @Argument var bottle: String
+        @Argument var pin: String
+        func run() async throws {
+            let b = try BottleStore().get(bottle)
+            guard let p = b.settings.pins.first(where: { $0.name.lowercased() == pin.lowercased() }) else { fail("no pin '\(pin)' in \(b.name)") }
+            guard let profile = p.interpolation else { print("\(p.name): no frame interpolation profile"); return }
+            adoptKnownEngineFacts()
+            let eng = try EngineStore().engine(b.settings.engineID)
+            // As WineRunner.start(pin:) does: a mode this engine cannot run gives way to the environment's.
+            let requested = p.renderer.flatMap { $0.unavailableReason(in: eng) == nil ? $0 : nil }
+            let renderer = try b.effectiveRenderer(requested: requested, engine: eng).renderer
+            let launch = profile.launch(executable: p.executableURL(driveC: b.driveC), renderer: renderer, engine: eng, bottle: b)
+            print(launch.note)
+            let env = try b.environment(engine: eng, renderer: requested, extra: p.environment.merging(launch.environment) { _, new in new })
+            for key in ["D3DM_MAX_FPS", "D3DM_MTL4", "D3DM_ENABLE_METALFX", "D3DM_NVNGX_PATH", "CX_D3DMETALPATH", "CX_ACTIVE_GRAPHICS_BACKEND"] { print("\(key)=\(env[key] ?? "(unset)")") }
+            print("cwd=\(launch.workingDirectory.path)")
+            if case .unavailable = launch.status { throw ExitCode(2) }
+        }
+    }
+}
+
+/// `highball pin set … interpolation` values: `off`, or `cap=60 mtl4=0 cwd=../../..`.
+enum InterpolationArgument {
+    static func parse(_ words: [String]) -> FrameInterpolationProfile?? {
+        if words == ["off"] { return .some(nil) }
+        guard !words.isEmpty else { return nil }
+        var p = FrameInterpolationProfile()
+        for word in words {
+            let parts = word.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { return nil }
+            switch parts[0] {
+            case "cap": guard let n = Int(parts[1]), n > 0 else { return nil }; p.presentedCap = n
+            case "mtl4": guard ["0", "1"].contains(parts[1]) else { return nil }; p.metal4 = parts[1] == "1"
+            case "cwd": p.workingDirectory = parts[1]
+            default: return nil
+            }
+        }
+        return .some(p)
+    }
+    static func describe(_ p: FrameInterpolationProfile) -> String {
+        [p.presentedCap.map { "cap=\($0)" }, p.metal4.map { "mtl4=\($0 ? 1 : 0)" }, p.workingDirectory.map { "cwd=\($0)" }]
+            .compactMap { $0 }.joined(separator: ",")
     }
 }
 

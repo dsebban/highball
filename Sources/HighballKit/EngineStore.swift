@@ -306,6 +306,12 @@ public struct EngineStore: Sendable {
         progress: DownloadProgress? = nil
     ) async throws -> InstalledEngine {
         try paths.ensure()
+        // An engine whose D3DMetal was linked from this Mac (install(_:localD3DMetal:)) names that
+        // folder, with nothing to extract, as the component: a reinstall links it again (and says
+        // so when that folder is gone) instead of hashing a folder as a download.
+        if let d3dmetal = manifest.components["d3dmetal"], d3dmetal.url.isFileURL, d3dmetal.extract == nil {
+            return try await install(manifest, localD3DMetal: d3dmetal.url, accepted: accepted, progress: progress)
+        }
         // An engine measured only on a newer macOS is neither offered nor installed on an older one (highball#85).
         // The engine picker and the updates filtered on it, but Play's engine ask could still install one: the arm64
         // line on macOS 26.4, where it cannot start (2026-10-19).
@@ -361,6 +367,66 @@ public struct EngineStore: Sendable {
         try FileManager.default.moveItem(at: staging, to: root)
         try stripQuarantine(root)
         return InstalledEngine(manifest: saved, root: root)
+    }
+
+    /// Installs `manifest` with its D3DMetal taken from a Game Porting Toolkit already on this Mac
+    /// (`source` holds `external/D3DMetal.framework` and `wine/`, the layout of GPTK's `redist/lib`
+    /// and of CrossOver's `lib64/apple_gptk`) instead of downloading Apple's files. The engine's
+    /// `renderers/d3dmetal` links to `source`, so Apple's framework is not copied and nothing
+    /// changes in `source` (the timestamp shim, `timestampShimDir`, still writes its renamed copy
+    /// of `d3d12.dll` into the engine, as for a downloaded D3DMetal). The local framework's version must be the one the manifest's
+    /// d3dmetal component names: a different D3DMetal would run with a shim and notes measured for
+    /// another. Apple's licence must be accepted, as for the download. Should `source` go away
+    /// later, `rendererDir` no longer finds the overlay and the runtime template's D3DMetal (or the
+    /// environment's fallback mode) serves, as on an engine without the component.
+    public func install(_ manifest: EngineManifest, localD3DMetal source: URL, accepted: Set<String>,
+                        progress: DownloadProgress? = nil) async throws -> InstalledEngine {
+        guard let license = EngineManifest.gatedRenderers["d3dmetal"], accepted.contains(license) else {
+            throw HighballError.failed("A local D3DMetal runs under Apple's Game Porting Toolkit licence; accept it to import one.")
+        }
+        guard let wanted = manifest.components["d3dmetal"] else {
+            throw HighballError.invalid("\(manifest.id) has no d3dmetal component to take from this Mac")
+        }
+        let local = try Self.localD3DMetal(at: source, matching: wanted)
+        var remote = manifest
+        remote.components["d3dmetal"] = nil
+        var engine = try await install(remote, accepted: accepted, progress: progress)
+        let dir = engine.renderersDir.appending(path: "d3dmetal", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for sub in ["wine", "external"] {
+            try FileManager.default.createSymbolicLink(at: dir.appending(path: sub), withDestinationURL: source.appending(path: sub))
+        }
+        var saved = engine.manifest
+        saved.components["d3dmetal"] = local
+        try saved.save(to: engine.root.appending(path: "manifest.json"))
+        engine = InstalledEngine(manifest: saved, root: engine.root)
+        return engine
+    }
+
+    /// The manifest component describing a local D3DMetal, after checking it is whole and is the
+    /// version `wanted` names (its version string starts "D3DMetal-<CFBundleShortVersionString> ").
+    public static func localD3DMetal(at source: URL, matching wanted: EngineManifest.Component) throws -> EngineManifest.Component {
+        let fm = FileManager.default
+        let required = ["external/D3DMetal.framework/Versions/A/D3DMetal", "external/libd3dshared.dylib",
+                        "wine/x86_64-windows/d3d12.dll", "wine/x86_64-windows/dxgi.dll", "wine/x86_64-windows/d3d11.dll",
+                        "wine/x86_64-unix/d3d12.so", "wine/x86_64-unix/dxgi.so"]
+        let missing = required.filter { !fm.fileExists(atPath: source.appending(path: $0).path) }
+        guard missing.isEmpty else { throw HighballError.missing("D3DMetal files in \(source.path): \(missing.joined(separator: ", "))") }
+        guard let version = FrameInterpolationProfile.d3dmetalVersion(in: source) else {
+            throw HighballError.invalid("no D3DMetal version in \(source.path)/external/D3DMetal.framework")
+        }
+        guard let named = wanted.version, named.hasPrefix("D3DMetal-\(version) ") || named == "D3DMetal-\(version)" else {
+            throw HighballError.invalid("this Mac's D3DMetal is \(version), the engine's component is \(wanted.version ?? "unversioned")")
+        }
+        let binary = source.appending(path: "external/D3DMetal.framework/Versions/A/D3DMetal")
+        var component = wanted
+        component.url = source
+        component.sha256 = try EngineStore().sha256(of: binary)
+        component.size = nil
+        component.extract = nil
+        component.version = "D3DMetal-\(version) (local, linked from \(source.path))"
+        component.note = "Not downloaded: linked from a Game Porting Toolkit installed on this Mac. sha256 is D3DMetal.framework's binary."
+        return component
     }
 
     /// Records acceptance of a license for an already-installed engine.
