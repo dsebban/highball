@@ -482,9 +482,11 @@ struct Run: AsyncParsableCommand {
             return b.settings.environment(forGame: db[appid]?.id)
         }()
         if !scoped.isEmpty { print("with the game's own variables: " + scoped.keys.sorted().joined(separator: ", ")) }
-        let result: LaunchResult
-        if let pin = b.settings.pins.first(where: { $0.name.lowercased() == program.lowercased() }) {
-            var p = pin
+        // One launch of a matched pin, whatever matched it: the name Play passes, or the
+        // program's own path — a bridge (Heroic through Highball's wine) or a sideload knows
+        // only the executable, and the game should still get the settings its pin carries.
+        func launchMatchedPin(_ matched: Pin) async throws -> LaunchResult {
+            var p = matched
             if let renderer { p.renderer = renderer }
             p.arguments += arguments
             p.environment.merge(scoped) { _, new in new }
@@ -492,29 +494,42 @@ struct Run: AsyncParsableCommand {
                 switch WineRunner.steamInvocation(clientRunning: runner.steamIsRunning(), arguments: p.arguments) {
                 case .forward:
                     print("Steam is already running in this bottle; handed it: \(p.arguments.joined(separator: " "))")
-                    if let forwarded = try await runner.forwardToRunningSteam(p.arguments, onOutput: out) { result = forwarded }
-                    else { result = try await runner.start(pin: p, onOutput: out) }
+                    if let forwarded = try await runner.forwardToRunningSteam(p.arguments, onOutput: out) { return forwarded }
+                    return try await runner.start(pin: p, onOutput: out)
                 case .showWindow:
                     print("Steam is already running in this bottle; asked it to show its window")
-                    if let shown = try await runner.showRunningSteam(onOutput: out) { result = shown }
-                    else { result = try await runner.start(pin: p, onOutput: out) }
+                    if let shown = try await runner.showRunningSteam(onOutput: out) { return shown }
+                    return try await runner.start(pin: p, onOutput: out)
                 case .start:
-                    result = try await runner.startResumingKnownSteamCrash(pin: p, onOutput: out ?? { _ in }).result
+                    return try await runner.startResumingKnownSteamCrash(pin: p, onOutput: out ?? { _ in }).result
                 }
-            } else {
-                result = try await runner.start(pin: p, onOutput: out)
             }
+            return try await runner.start(pin: p, onOutput: out)
+        }
+        let result: LaunchResult
+        if let pin = b.settings.pins.first(where: { $0.name.lowercased() == program.lowercased() }) {
+            result = try await launchMatchedPin(pin)
         } else if program.contains(":") || program.contains("\\") {
             let named = b.resolve(windowsPath: program)
             WineReparsePoint.dematerializeAlong(named, driveC: b.driveC)
             let exe = WineReparsePoint.follow(named, driveC: b.driveC) ?? named
-            result = try await runner.start(exe, arguments: arguments, renderer: renderer, extraEnvironment: scoped,
-                                            workingDirectory: exe.deletingLastPathComponent(),
-                                            program: exe.path == named.path ? nil : program, onOutput: out)
+            if let pin = Pin.matchingExecutable(exe, in: b.settings.pins, driveC: b.driveC) {
+                print("'\(program)' is the program of the pin '\(pin.name)' — launching it as that pin")
+                result = try await launchMatchedPin(pin)
+            } else {
+                result = try await runner.start(exe, arguments: arguments, renderer: renderer, extraEnvironment: scoped,
+                                                workingDirectory: exe.deletingLastPathComponent(),
+                                                program: exe.path == named.path ? nil : program, onOutput: out)
+            }
         } else if FileManager.default.fileExists(atPath: program) {
             let exe = URL(fileURLWithPath: program)
-            result = try await runner.start(exe, arguments: arguments, renderer: renderer,
-                                            workingDirectory: exe.deletingLastPathComponent(), onOutput: out)
+            if let pin = Pin.matchingExecutable(exe, in: b.settings.pins, driveC: b.driveC) {
+                print("'\(program)' is the program of the pin '\(pin.name)' — launching it as that pin")
+                result = try await launchMatchedPin(pin)
+            } else {
+                result = try await runner.start(exe, arguments: arguments, renderer: renderer,
+                                                workingDirectory: exe.deletingLastPathComponent(), onOutput: out)
+            }
         } else {
             // Not a pin, not a Windows path, not a local file: let Wine resolve it (cmd, dxdiag,
             // notepad, anything on the Windows PATH) instead of failing on a made-up unix path.
@@ -790,6 +805,21 @@ struct Epic: AsyncParsableCommand {
             let eng = try EngineStore().engine(b.settings.engineID)
             let info = try store.launchInfo(app, offline: offline)
             let runner = WineRunner(engine: eng, bottle: b)
+            // The game's own pin, when one exists, gives the launch the per-game settings Play
+            // gives it — a frame interpolation profile, its own working directory, its
+            // environment — instead of the bare executable this path used to start, where a
+            // cap set for an Epic game never applied. Legendary's own launch parameters and
+            // environment ride on top of the pin's.
+            if let pin = Pin.matchingExecutable(info.executable, in: b.settings.pins, driveC: b.driveC) {
+                var p = pin
+                p.arguments += info.arguments
+                p.environment.merge(info.environment) { _, new in new }
+                if let renderer { p.renderer = renderer }
+                print("launching \(app) through the game's pin '\(pin.name)'")
+                let result = try await runner.start(pin: p)
+                print("exit=\(result.exitStatus) — log: \(result.log.path)")
+                return
+            }
             let result = try await runner.start(info.executable, arguments: info.arguments,
                                                 renderer: renderer, extraEnvironment: info.environment,
                                                 workingDirectory: info.workingDirectory)

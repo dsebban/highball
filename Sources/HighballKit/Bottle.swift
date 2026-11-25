@@ -337,6 +337,16 @@ public struct Pin: Codable, Sendable, Identifiable, Hashable {
         renderer = try c.decodeIfPresent(Renderer.self, forKey: .renderer)
         interpolation = try c.decodeIfPresent(FrameInterpolationProfile.self, forKey: .interpolation)
     }
+
+    /// The pin whose program is `exe` — how a launch that knows only the executable, not the
+    /// pin's name (`run` given a path, `epic launch` reading Legendary's record, a launcher
+    /// bridging Heroic's wine) still gets the per-game settings Play gives. Exact path first,
+    /// then case-insensitive, the way Wine resolves program names.
+    public static func matchingExecutable(_ exe: URL, in pins: [Pin], driveC: URL) -> Pin? {
+        let target = exe.standardizedFileURL.path
+        return pins.first { $0.executableURL(driveC: driveC).standardizedFileURL.path == target }
+            ?? pins.first { $0.executableURL(driveC: driveC).standardizedFileURL.path.lowercased() == target.lowercased() }
+    }
 }
 
 /// One-line editing of a pin's argument list. Double quotes group words; backslash
