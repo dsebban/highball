@@ -317,7 +317,7 @@ struct PinCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "pin",
         abstract: "Per-program settings: persistent launch arguments, environment, renderer.",
-        subcommands: [List.self, Add.self, Set.self, Check.self])
+        subcommands: [List.self, Add.self, Remove.self, Set.self, Check.self])
 
     struct Add: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Pin a program: a Windows path, a unix path (preinstalled games anywhere on disk), or a drive_c-relative path.")
@@ -344,6 +344,23 @@ struct PinCommand: AsyncParsableCommand {
             b.settings.pins.append(pin)
             try bs.update(b)
             print("pinned \(name) -> \(pin.path)")
+        }
+    }
+
+    struct Remove: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Remove a pin: its settings go, the program stays.")
+        @Argument var bottle: String
+        @Argument var pin: String
+
+        func run() async throws {
+            let bs = BottleStore()
+            var b = try bs.get(bottle)
+            guard let i = b.settings.pins.firstIndex(where: { $0.name.lowercased() == pin.lowercased() }) else {
+                fail("no pin '\(pin)' in \(b.name) (pins: \(b.settings.pins.map(\.name).joined(separator: ", ")))")
+            }
+            let removed = b.settings.pins.remove(at: i)
+            try bs.update(b)
+            print("unpinned \(removed.name) -> \(removed.path)")
         }
     }
 
